@@ -1,209 +1,128 @@
-# BetterAimAssist
+## <img src="./src/assets/logo.png" width="28" style="vertical-align: middle; border-radius: 6px;"> BetterAimAssist
+Virtual Xbox controller proxy that adds rapid axis jitter to boost aim assist in PC games.
 
-<div align="center">
+### <img height="18" src="./src/assets/readme/architecture.svg" style="vertical-align: middle;">&nbsp;&nbsp;Architecture
 
-![Platform](https://img.shields.io/badge/platform-Windows-blue?style=for-the-badge&logo=windows)
-![Language](https://img.shields.io/badge/built%20with-Rust-orange?style=for-the-badge&logo=rust)
-![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
+```mermaid
+graph LR
+    subgraph Input["Input Thread (250Hz, TIME_CRITICAL)"]
+        A[XInput / HID poll] --> B[Read physical state]
+        B --> C[Calculate jitter]
+        C --> D{stick_idle?}
+        D -->|yes| E[tick % 2]
+        D -->|no| F[pass through]
+        E --> G[AXIS_MIN / AXIS_MAX]
+        G --> H[Build XGamepad]
+        F --> H
+    end
 
-**A virtual Xbox controller proxy that adds rapid axis jitter to boost aim assist in PC games.**
+    subgraph Main["Main Thread"]
+        I[Receive XGamepad] --> J[ViGEmBus update]
+    end
 
-</div>
+    H -.->|mpsc| I
 
----
+    O[Physical Controller] --> A
+    J --> P[Virtual Xbox 360]
+    P --> Q[Game]
 
-## What is this?
-
-BetterAimAssist sits between your physical controller and the game. It creates a virtual Xbox 360 controller that mirrors all your inputs in real time. When toggled on with **F5**, it rapidly oscillates the left stick X axis between -1 and +1 at ~60 Hz — a technique that exploits aim assist algorithms in games that use magnetism-based targeting.
-
+    R[check_anti_cheat] -->|EAC found| S[Exit]
+    R -->|clean| T[Continue]
+    L[Ctrl+C] --> M[HidHide cleanup]
+    M --> N[Exit]
 ```
-Physical controller  →  BetterAimAssist  →  Virtual controller  →  Game
-      (hidden)               (proxy)             (visible)
-```
 
-Jitter is automatically disabled when you move the left stick, so it never interferes with movement.
-
----
-
-## Features
+### <img height="18" src="./src/assets/readme/features.svg" style="vertical-align: middle;">&nbsp;&nbsp;Features
 
 - Supports **Xbox**, **DualSense (PS5)** and **DualShock 4 (PS4)** controllers
+- **hidapi** with native Windows HID driver for Sony controllers
 - Automatic driver detection — opens download page if something is missing
-- Hides the physical controller from games via **HidHide** (no double input)
-- Mirrors all buttons, triggers and sticks from physical to virtual in real time
-- **F5** toggles jitter on/off at any time, even mid-game
-- **L2** activates jitter while held, even if F5 is off
-- Jitter pauses automatically while you move the left stick
-- Colored terminal UI with status output
-- Warns you if the game is already running before the tool
+- Hides physical controller via **HidHide** (no double input)
+- **EasyAntiCheat detection** — refuses to run if EAC is active
+- Mirrors all buttons, triggers and sticks in real time
+- **F5** toggles jitter on/off — **L2** activates while held
+- Jitter pauses when you move the left stick
+- **4ms polling** (250Hz) with spin-wait timing
+- High-priority input thread for consistent timing
+- Graceful exit with **Ctrl+C**
 
----
-
-## Requirements
-
-| Requirement | Details |
-|---|---|
-| OS | Windows 10 / 11 x64 |
-| Controller | Xbox (wired or Bluetooth), DualSense (PS5), DualShock 4 (PS4) |
-| Driver | [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) — no reboot needed |
-| Driver | [HidHide](https://github.com/nefarius/HidHide/releases) — reboot required after install |
-| Permissions | Run as **Administrator** |
-
----
-
-## Installation
-
-### Step 1 — Install drivers
-
-BetterAimAssist checks for the required drivers on startup. If one or both are missing, it opens the download page(s) automatically with a 3-second countdown, then exits so you can install them.
-
-- **ViGEmBus** does not require a reboot — run the tool again immediately after installing.
-- **HidHide** requires a full reboot before the tool will detect it.
-
-Manual links:
-- **ViGEmBus**: https://github.com/nefarius/ViGEmBus/releases
-- **HidHide**: https://github.com/nefarius/HidHide/releases
-
-### Step 2 — Download BetterAimAssist
-
-Download the latest `BetterAimAssist.exe` from the **[Releases](../../releases)** page. No installation needed — just run the `.exe`.
-
-### Step 3 — Run as Administrator
-
-Right-click the `.exe` → **Run as administrator**. This is required for HidHide to hide the physical controller.
-
-### Step 4 — Launch order matters
-
-> **Always open BetterAimAssist *before* your game.**
-
-This ensures the virtual controller occupies XInput slot 0 (which the game picks up), while the physical controller falls to slot 1 (used internally by the tool). If you open the game first, the tool will warn you.
-
----
-
-## Usage
-
-When everything is ready, you'll see:
+### <img height="18" src="./src/assets/readme/structure.svg" style="vertical-align: middle;">&nbsp;&nbsp;Structure
 
 ```
-╔══════════════════════════════════════════════════════════╗
-║           BETTER AIM-ASSIST by Kira Kohler               ║
-╚══════════════════════════════════════════════════════════╝
-
-┌─ CONTROLLER TYPE ─────────────────────────────────────────
-│  [1] Xbox / Xbox-compatible
-│  [2] DualSense (PS5)
-│  [3] DualShock 4 (PS4)
-└───────────────────────────────────────────────────────────
-
-┌─ DEPENDENCIES ────────────────────────────────────────────
-│  [✓] ViGEmBus driver   — installed
-│  [✓] HidHide driver    — installed
-└───────────────────────────────────────────────────────────
-
-┌─ HIDHIDE CLOAKING ────────────────────────────────────────
-│  [✓] Cloaking active — physical controller hidden from games.
-└───────────────────────────────────────────────────────────
-
-┌─ VIRTUAL CONTROLLER ──────────────────────────────────────
-│  [✓] Xbox 360 virtual controller is live.
-└───────────────────────────────────────────────────────────
-
-╔══════════════════════════════════════════════════════════╗
-║  READY  —  open your game NOW if not yet open            ║
-║  F5       →  toggle axis jitter ON / OFF                 ║
-║  L2       →  jitter while held (even if F5 OFF)          ║
-║  Ctrl+C   →  exit (do this BEFORE closing the game)      ║
-╚══════════════════════════════════════════════════════════╝
+src/
+├── main.rs                # Entry point
+├── build.rs               # Windows resources
+├── Cargo.toml             # Dependencies
+└── resources/
+    └── BetterAimAssist.manifest
 ```
 
-| Key | Action |
-|---|---|
-| `F5` | Toggle left stick X axis jitter **ON / OFF** (persistent) |
-| `L2` | Activate jitter **while held**, even if F5 is OFF |
-| `Ctrl+C` | Exit cleanly — always do this before closing the game |
+### <img height="18" src="./src/assets/readme/controller-support.svg" style="vertical-align: middle;">&nbsp;&nbsp;Controller Support
 
----
+**Xbox** — Full support via XInput. USB and Bluetooth.
 
-## Controller support
+**DualSense / DualShock 4** — Full support via hidapi. USB and Bluetooth.
 
-### Xbox / Xbox-compatible
-Full support via XInput. USB and Bluetooth.
-
-### DualSense (PS5)
-Full support via direct HID. USB and Bluetooth. Button mapping:
-
-| PS5 | Xbox (virtual) |
-|---|---|
+| PS | Xbox |
+|----|------|
 | Cross | A |
 | Circle | B |
 | Square | X |
 | Triangle | Y |
-| L1 | LB |
-| R1 | RB |
-| L2 | LT |
-| R2 | RT |
-| L3 | LS |
-| R3 | RS |
-| Options | Start |
-| Create | Back |
+| L1/R1 | LB/RB |
+| L2/R2 | LT/RT |
+| L3/R3 | LS/RS |
+| Options/Create | Start/Back |
 | D-Pad | D-Pad |
+> [!NOTE]
+> Close Steam, DS4Windows or any other app that might be using the controller before running BetterAimAssist.
 
-### DualShock 4 (PS4)
-Same button mapping as DualSense. Both V1 (CUH-ZCT1) and V2 (CUH-ZCT2) are supported.
-
-> **Note:** Close Steam, DS4Windows or any other app that might be using the controller before running BetterAimAssist.
-
----
-
-## Game compatibility
-
-> BetterAimAssist has been tested on **Fortnite**. It will likely work on other games that have strong magnetism-based aim assist and XInput support on PC — but results are not guaranteed.
-
-### Tested
+### <img height="18" src="./src/assets/readme/game-compatibility.svg" style="vertical-align: middle;">&nbsp;&nbsp;Game Compatibility
 
 | Game | Status |
 |---|---|
-| Fortnite | ✅ Works |
+| Fortnite | Works |
+| Warzone / Modern Warfare | Probably works (untested) |
+| Apex Legends | Probably works (untested) |
 
-### Probably works (untested)
+### <img height="18" src="./src/assets/readme/installation.svg" style="vertical-align: middle;">&nbsp;&nbsp;Installation
 
-Games with aggressive magnetism-based aim assist and XInput support on PC:
+1. Install **[ViGEmBus](https://github.com/nefarius/ViGEmBus/releases)** and **[HidHide](https://github.com/nefarius/HidHide/releases)** (reboot required for HidHide)
+2. Download `BetterAimAssist.exe` from **[Releases](https://github.com/Kira-Kohler/BetterAimAssist/releases)**
+3. Run as **Administrator**
 
-- Warzone / Modern Warfare
-- Apex Legends
+> [!WARNING]
+> **Always open BetterAimAssist *before* your game.**
 
----
+### <img height="18" src="./src/assets/readme/requirements.svg" style="vertical-align: middle;">&nbsp;&nbsp;Requirements
 
-## Building from source
+| Requirement | Details |
+|-------------|---------|
+| OS | Windows 10 / 11 x64 |
+| Controller | Xbox (wired or Bluetooth), DualSense (PS5), DualShock 4 (PS4) |
+
+### <img height="18" src="./src/assets/readme/troubleshooting.svg" style="vertical-align: middle;">&nbsp;&nbsp;Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| **EAC detected on startup** | Close the game first |
+| **Controller not detected** | Wait 10s or reconnect Bluetooth |
+| **Double input** | Launch tool *before* the game |
+| **Access denied** | Run as Administrator |
+| **Bluetooth Xbox not detected** | Unpair and re-pair in Windows Settings |
+| **PS4/PS5 controller not opening** | Close Steam, DS4Windows or any other app using the controller |
+| **HidHide CLI not found** | Reboot your PC after installing HidHide |
+
+### <img height="18" src="./src/assets/readme/building-from-source.svg" style="vertical-align: middle;">&nbsp;&nbsp;Building from Source
 
 ```bash
-# Requires Rust 1.75+ (https://rustup.rs) and Windows
+Requires Rust 1.75+ (https://rustup.rs) and Windows
 git clone https://github.com/Kira-Kohler/BetterAimAssist
 cd BetterAimAssist
 cargo build --release
 # Output → target/release/BetterAimAssist.exe
 ```
 
----
-
-## Troubleshooting
-
-| Problem | Fix |
-|---|---|
-| **Controller not detected** | Wait 10 seconds — the tool will show a hint automatically |
-| **Bluetooth Xbox controller not detected** | Unpair the controller in Windows Settings (Bluetooth → remove device), then re-pair it. Simply disconnecting is not enough |
-| **Bluetooth PS4/PS5 controller not detected** | Same — fully unpair and re-pair in Windows Settings |
-| **USB controller not detected** | Unplug and replug the cable. Make sure you're using a data cable, not a charge-only cable |
-| **PS4/PS5 controller not opening** | Close Steam, DS4Windows or any other app using the controller, then restart the tool |
-| **Double input / button registers twice** | Launch BetterAimAssist *before* the game. If the game was already open: close game → close tool → open tool → open game |
-| **HidHide CLI not found after install** | Reboot your PC — the HidHide driver requires a full restart to initialize |
-| **Virtual controller not detected by the game** | Close both the game and the tool, reopen the tool first, wait for `Virtual controller is live`, then open the game |
-| **Virtual controller not ready (WinError)** | The tool retries automatically. If it keeps failing, reinstall ViGEmBus and run as Administrator |
-| **Jitter ON but aim assist doesn't feel different** | Make sure aim assist is enabled in-game for controllers |
-| **Tool says "access denied"** | Run as Administrator — right-click the exe → Run as administrator |
-
----
-
-## License
+### <img height="18" src="./src/assets/readme/license.svg" style="vertical-align: middle;">&nbsp;&nbsp;License
 
 MIT — do whatever you want with it.
