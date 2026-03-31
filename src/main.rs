@@ -619,6 +619,7 @@ fn xinput_read_loop(
 fn hid_read_loop(
     controller_type: ControllerType,
     tx: Sender<XGamepad>,
+    ready_tx: std::sync::mpsc::SyncSender<()>,
     enabled: std::sync::Arc<AtomicBool>,
     running: std::sync::Arc<AtomicBool>,
 ) {
@@ -631,13 +632,19 @@ fn hid_read_loop(
         ControllerType::Xbox       => return,
     };
 
-    let hid = hidapi::HidApi::new().expect("Failed to init HidApi");
-
     let mut dev = None;
     let mut elapsed = 0u64;
     let mut hint_shown = false;
 
     loop {
+        let hid = match hidapi::HidApi::new() {
+            Ok(h) => h,
+            Err(_) => {
+                thread::sleep(Duration::from_secs(1));
+                elapsed += 1;
+                continue;
+            }
+        };
         for device in hid.device_list() {
             if device.vendor_id() == vid && pids.contains(&device.product_id()) {
                 if let Ok(opened) = device.open_device(&hid) {
@@ -653,9 +660,9 @@ fn hid_read_loop(
 
         if elapsed >= 10 && !hint_shown {
             println!();
-            eprintln!("[WARN] Controller not detected after 10 seconds.");
-            eprintln!("[WARN] Make sure the controller is connected via USB or Bluetooth.");
-            eprintln!("[WARN] If Bluetooth: unpair in Windows Settings, then re-pair.");
+            warn("Controller not detected after 10 seconds.");
+            warn("Make sure the controller is connected via USB or Bluetooth.");
+            warn("If Bluetooth: unpair in Windows Settings, then re-pair.");
             hint_shown = true;
         }
         print!(".");
@@ -667,7 +674,8 @@ fn hid_read_loop(
             return;
         }
     }
-    println!();
+
+    let _ = ready_tx.try_send(());
 
     let device = dev.unwrap();
     device.set_blocking_mode(false).ok();
@@ -757,13 +765,6 @@ fn main() {
     ok("Xbox 360 virtual controller is live.");
     sep();
 
-    println!("\n{GREEN}{BOLD}╔{bar}╗{RESET}", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "READY  —  open your game NOW if not yet open", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "F5       →  toggle Aim Assist ON / OFF",       width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "L2       →  jitter while held (even if F5 OFF)", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "Ctrl+C   →  exit (BEFORE closing the game)",    width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-    println!("{GREEN}{BOLD}╚{bar}╝{RESET}\n", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-
     let enabled = std::sync::Arc::new(AtomicBool::new(false));
     let running = std::sync::Arc::new(AtomicBool::new(true));
     let (tx, rx) = channel();
@@ -830,17 +831,26 @@ fn main() {
             };
             info(&format!("Waiting for {} (USB or Bluetooth)...", name));
 
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
             let tx_clone = tx;
             let running_clone = running.clone();
             let enabled_clone = enabled.clone();
             std::thread::spawn(move || {
-                hid_read_loop(controller_type, tx_clone, enabled_clone, running_clone);
+                hid_read_loop(controller_type, tx_clone, ready_tx, enabled_clone, running_clone);
             });
 
-            thread::sleep(Duration::from_secs(1));
+            let _ = ready_rx.recv();
+            ok(&format!("{} connected.", name));
             sep();
         }
     }
+
+    println!("\n{GREEN}{BOLD}╔{bar}╗{RESET}", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "READY  —  open your game NOW if not yet open", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "F5       →  toggle Aim Assist ON / OFF",       width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "L2       →  jitter while held (even if F5 OFF)", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "Ctrl+C   →  exit (BEFORE closing the game)",    width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+    println!("{GREEN}{BOLD}╚{bar}╝{RESET}\n", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
 
     let mut f5_was_down = false;
 
