@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use vigem_client::{Client, Xbox360Wired, XGamepad};
@@ -618,10 +619,10 @@ fn xinput_read_loop(
 
 fn hid_read_loop(
     controller_type: ControllerType,
-    tx: Sender<XGamepad>,
+    target: Arc<Mutex<Xbox360Wired<Client>>>,
     ready_tx: std::sync::mpsc::SyncSender<()>,
-    enabled: std::sync::Arc<AtomicBool>,
-    running: std::sync::Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
 ) {
     elevate_thread_priority();
 
@@ -678,43 +679,43 @@ fn hid_read_loop(
     let _ = ready_tx.try_send(());
 
     let device = dev.unwrap();
-    device.set_blocking_mode(false).ok();
+    device.set_blocking_mode(true).ok();
 
     let mut buf = [0u8; 64];
     let mut tick: u64 = 0;
 
     while running.load(Ordering::Relaxed) {
-        let deadline = Instant::now() + Duration::from_micros(POLL_US);
+        let n = match device.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
 
-        match device.read_timeout(&mut buf, 1) {
-            Ok(n) if n >= 10 => {
-                let (lx, ly, rx, ry, lt, rt, buttons, lt_held) = match controller_type {
-                    ControllerType::DualShock4 => read_ds4(&buf),
-                    ControllerType::DualSense  => read_dualsense(&buf),
-                    ControllerType::Xbox       => continue,
-                };
+        if n < 10 { continue; }
 
-                let stick_idle = (lx as i32).abs() < 8000 && (ly as i32).abs() < 8000;
-                let jitter_active = (enabled.load(Ordering::Relaxed) || lt_held) && stick_idle;
-                let axis_value: i16 = if tick % 2 == 0 { AXIS_MIN } else { AXIS_MAX };
+        let (lx, ly, rx, ry, lt, rt, buttons, lt_held) = match controller_type {
+            ControllerType::DualShock4 => read_ds4(&buf),
+            ControllerType::DualSense  => read_dualsense(&buf),
+            ControllerType::Xbox       => continue,
+        };
 
-                let gamepad = XGamepad {
-                    buttons:       vigem_client::XButtons(buttons),
-                    left_trigger:  lt,
-                    right_trigger: rt,
-                    thumb_lx:      if jitter_active { axis_value } else { lx },
-                    thumb_ly:      ly,
-                    thumb_rx:      rx,
-                    thumb_ry:      ry,
-                };
+        let stick_idle = (lx as i32).abs() < 8000 && (ly as i32).abs() < 8000;
+        let jitter_active = (enabled.load(Ordering::Relaxed) || lt_held) && stick_idle;
+        let axis_value: i16 = if tick % 2 == 0 { AXIS_MIN } else { AXIS_MAX };
 
-                let _ = tx.send(gamepad);
-                tick = tick.wrapping_add(1);
-            }
-            _ => {}
+        let gamepad = XGamepad {
+            buttons:       vigem_client::XButtons(buttons),
+            left_trigger:  lt,
+            right_trigger: rt,
+            thumb_lx:      if jitter_active { axis_value } else { lx },
+            thumb_ly:      ly,
+            thumb_rx:      rx,
+            thumb_ry:      ry,
+        };
+
+        if let Ok(mut t) = target.lock() {
+            let _ = t.update(&gamepad);
         }
-
-        precise_spin_wait(deadline);
+        tick = tick.wrapping_add(1);
     }
 }
 
@@ -765,9 +766,9 @@ fn main() {
     ok("Xbox 360 virtual controller is live.");
     sep();
 
-    let enabled = std::sync::Arc::new(AtomicBool::new(false));
-    let running = std::sync::Arc::new(AtomicBool::new(true));
-    let (tx, rx) = channel();
+    let enabled = Arc::new(AtomicBool::new(false));
+    let running = Arc::new(AtomicBool::new(true));
+    let target   = Arc::new(Mutex::new(target));
 
     OWN_EXE_PATH.set(own_exe.clone()).ok();
     unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 1); }
@@ -814,12 +815,47 @@ fn main() {
             };
             sep();
 
-            let tx_clone = tx;
+            let (tx, rx) = channel::<XGamepad>();
+            let target_clone  = target.clone();
             let running_clone = running.clone();
             let enabled_clone = enabled.clone();
             std::thread::spawn(move || {
-                xinput_read_loop(phys_idx, tx_clone, enabled_clone, running_clone);
+                xinput_read_loop(phys_idx, tx, enabled_clone, running_clone);
             });
+
+            println!("\n{GREEN}{BOLD}╔{bar}╗{RESET}", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "READY  —  open your game NOW if not yet open", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "F5       →  toggle Aim Assist ON / OFF",       width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "L2       →  jitter while held (even if F5 OFF)", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "Ctrl+C   →  exit (BEFORE closing the game)",    width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            println!("{GREEN}{BOLD}╚{bar}╝{RESET}\n", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+
+            let mut f5_was_down = false;
+            loop {
+                let f5_down = unsafe { GetAsyncKeyState(VK_F5) } as u16 & 0x8000 != 0;
+                if f5_down && !f5_was_down {
+                    let new_state = !enabled.load(Ordering::Relaxed);
+                    enabled.store(new_state, Ordering::Relaxed);
+                    if new_state {
+                        play_connect();
+                        println!("  {}{}[F5]{}  Aim Assist  ██ ON  ██{}", BOLD, GREEN, RESET, RESET);
+                    } else {
+                        play_disconnect();
+                        println!("  {}{}[F5]{}  Aim Assist  ░░ OFF ░░{}", BOLD, DIM, RESET, RESET);
+                    }
+                }
+                f5_was_down = f5_down;
+
+                let gamepad = match rx.recv_timeout(Duration::from_micros(POLL_US * 2)) {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                if let Ok(mut t) = target_clone.lock() {
+                    if let Err(e) = t.update(&gamepad) {
+                        eprintln!("  [!] Virtual controller update error: {:?}", e);
+                    }
+                }
+            }
         }
 
         ControllerType::DualShock4 | ControllerType::DualSense => {
@@ -832,50 +868,41 @@ fn main() {
             info(&format!("Waiting for {} (USB or Bluetooth)...", name));
 
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-            let tx_clone = tx;
+            let target_clone  = target.clone();
             let running_clone = running.clone();
             let enabled_clone = enabled.clone();
             std::thread::spawn(move || {
-                hid_read_loop(controller_type, tx_clone, ready_tx, enabled_clone, running_clone);
+                hid_read_loop(controller_type, target_clone, ready_tx, enabled_clone, running_clone);
             });
 
             let _ = ready_rx.recv();
             ok(&format!("{} connected.", name));
             sep();
-        }
-    }
 
-    println!("\n{GREEN}{BOLD}╔{bar}╗{RESET}", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "READY  —  open your game NOW if not yet open", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "F5       →  toggle Aim Assist ON / OFF",       width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "L2       →  jitter while held (even if F5 OFF)", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-    println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "Ctrl+C   →  exit (BEFORE closing the game)",    width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-    println!("{GREEN}{BOLD}╚{bar}╝{RESET}\n", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            println!("\n{GREEN}{BOLD}╔{bar}╗{RESET}", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "READY  —  open your game NOW if not yet open", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "F5       →  toggle Aim Assist ON / OFF",       width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "L2       →  jitter while held (even if F5 OFF)", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "Ctrl+C   →  exit (BEFORE closing the game)",    width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            println!("{GREEN}{BOLD}╚{bar}╝{RESET}\n", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
 
-    let mut f5_was_down = false;
-
-    loop {
-        let f5_down = unsafe { GetAsyncKeyState(VK_F5) } as u16 & 0x8000 != 0;
-        if f5_down && !f5_was_down {
-            let new_state = !enabled.load(Ordering::Relaxed);
-            enabled.store(new_state, Ordering::Relaxed);
-            if new_state {
-                play_connect();
-                println!("  {}{}[F5]{}  Aim Assist  ██ ON  ██{}", BOLD, GREEN, RESET, RESET);
-            } else {
-                play_disconnect();
-                println!("  {}{}[F5]{}  Aim Assist  ░░ OFF ░░{}", BOLD, DIM, RESET, RESET);
+            let mut f5_was_down = false;
+            loop {
+                let f5_down = unsafe { GetAsyncKeyState(VK_F5) } as u16 & 0x8000 != 0;
+                if f5_down && !f5_was_down {
+                    let new_state = !enabled.load(Ordering::Relaxed);
+                    enabled.store(new_state, Ordering::Relaxed);
+                    if new_state {
+                        play_connect();
+                        println!("  {}{}[F5]{}  Aim Assist  ██ ON  ██{}", BOLD, GREEN, RESET, RESET);
+                    } else {
+                        play_disconnect();
+                        println!("  {}{}[F5]{}  Aim Assist  ░░ OFF ░░{}", BOLD, DIM, RESET, RESET);
+                    }
+                }
+                f5_was_down = f5_down;
+                thread::sleep(Duration::from_millis(8));
             }
-        }
-        f5_was_down = f5_down;
-
-        let gamepad = match rx.recv_timeout(Duration::from_micros(POLL_US * 2)) {
-            Ok(g) => g,
-            Err(_) => continue,
-        };
-
-        if let Err(e) = target.update(&gamepad) {
-            eprintln!("  [!] Virtual controller update error: {:?}", e);
         }
     }
 }
