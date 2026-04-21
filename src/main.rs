@@ -1,62 +1,51 @@
-use std::io::Write;
+mod ui;
+
+use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
 use vigem_client::{Client, Xbox360Wired, XGamepad};
 use rusty_xinput::XInputHandle;
 use winreg::enums::*;
 use winreg::RegKey;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-use windows_sys::Win32::System::Console::{
-    SetConsoleTitleW, GetStdHandle, SetConsoleMode, GetConsoleMode,
-    STD_OUTPUT_HANDLE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-};
+use windows_sys::Win32::System::Console::SetConsoleTitleW;
 use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT};
 use windows_sys::Win32::System::Threading::{
     SetThreadPriority, GetCurrentThread, THREAD_PRIORITY_TIME_CRITICAL,
 };
-use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_C_EVENT};
+use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+use ui::{
+    banner, draw_dashboard, log_fail, log_info, log_ok, log_warn,
+    pause_and_exit, section_end, section_header, update_aim_status, enable_ansi,
+};
 
 const AXIS_MAX: i16 = 32767;
 const AXIS_MIN: i16 = -32768;
-const POLL_US: u64 = 4000;
-const VK_F5: i32 = 0x74;
+const POLL_US:  u64 = 4000;
+const VK_F5:    i32 = 0x74;
 
 const VIGEMBUS_URL: &str =
     "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe";
 const HIDHIDE_URL: &str =
     "https://github.com/nefarius/HidHide/releases/download/v1.5.230.0/HidHide_1.5.230_x64.exe";
 
-const W: usize = 60;
-
-const RESET:  &str = "\x1b[0m";
-const GREEN:  &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const RED:    &str = "\x1b[31m";
-const CYAN:   &str = "\x1b[36m";
-const BOLD:   &str = "\x1b[1m";
-const DIM:    &str = "\x1b[2m";
-
-const SONY_VID: u16 = 0x054C;
-const DS4_PIDS: &[u16] = &[0x05C4, 0x09CC];
-const DUALSENSE_PID: u16 = 0x0CE6;
+const SONY_VID:      u16    = 0x054C;
+const DS4_PIDS:      &[u16] = &[0x05C4, 0x09CC];
+const DUALSENSE_PID: u16    = 0x0CE6;
 
 #[derive(Clone, Copy)]
 enum ControllerType { Xbox, DualShock4, DualSense }
 
-fn enable_ansi() {
-    unsafe {
-        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        let mut mode = 0u32;
-        if GetConsoleMode(handle, &mut mode) != 0 {
-            SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-        }
-    }
-}
+pub static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+pub static STATUS_ROW:    AtomicU16  = AtomicU16::new(0);
+static OWN_EXE_PATH:      std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 const WINDOW_TITLES: &[&str] = &[
     "C:\\Windows\\System32\\cmd.exe",
@@ -75,57 +64,18 @@ fn set_random_window_title() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos() as usize;
-    let idx = seed % WINDOW_TITLES.len();
-    let title = WINDOW_TITLES[idx];
+    let title = WINDOW_TITLES[seed % WINDOW_TITLES.len()];
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe { SetConsoleTitleW(wide.as_ptr()); }
 }
 
 fn elevate_thread_priority() {
-    unsafe {
-        let thread = GetCurrentThread();
-        SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL);
-    }
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL); }
 }
-
-fn banner() {
-    let title = "BETTER AIM-ASSIST by Kira Kohler";
-    let pad = (W - 2 - title.len()) / 2;
-    println!("{}{}", CYAN, BOLD);
-    println!("╔{}╗", "═".repeat(W - 2));
-    println!("║{}{}{} ║", " ".repeat(pad), title, " ".repeat(W - 3 - pad - title.len()));
-    println!("╚{}╝{}", "═".repeat(W - 2), RESET);
-    println!();
-}
-
-fn section(label: &str) {
-    println!("\n{}{DIM}┌─{RESET} {BOLD}{}{RESET} {DIM}{}{RESET}",
-        "", label, "─".repeat(W.saturating_sub(4 + label.len())),
-        DIM=DIM, BOLD=BOLD, RESET=RESET);
-}
-
-fn ok(msg: &str)   { println!("{}│{}  {}[✓]{} {}", DIM, RESET, GREEN,  RESET, msg); }
-fn info(msg: &str) { println!("{}│{}  {}[·]{} {}", DIM, RESET, CYAN,   RESET, msg); }
-fn warn(msg: &str) { println!("{}│{}  {}[!]{} {}", DIM, RESET, YELLOW, RESET, msg); }
-fn fail(msg: &str) { println!("{}│{}  {}[✗]{} {}", DIM, RESET, RED,    RESET, msg); }
-fn sep()           { println!("{DIM}└{}{RESET}", "─".repeat(W - 1), DIM=DIM, RESET=RESET); }
 
 fn open_browser(url: &str) {
-    print!("{}│{}  Opening browser in", DIM, RESET);
-    std::io::stdout().flush().unwrap();
-    for i in (1..=3).rev() {
-        print!(" {}...", i);
-        std::io::stdout().flush().unwrap();
-        thread::sleep(Duration::from_secs(1));
-    }
-    println!();
+    log_info("Opening download page in browser...");
     let _ = Command::new("cmd").args(["/C", "start", "", url]).status();
-}
-
-fn pause_and_exit(code: i32) {
-    println!("\nPress Enter to exit...");
-    let _ = std::io::stdin().read_line(&mut String::new());
-    std::process::exit(code);
 }
 
 fn is_vigembus_installed() -> bool {
@@ -141,112 +91,47 @@ fn is_hidhide_installed() -> bool {
 }
 
 fn check_dependencies() {
-    section("DEPENDENCIES");
+    section_header("DEPENDENCIES");
 
-    let vigem_ok = is_vigembus_installed();
+    let vigem_ok   = is_vigembus_installed();
     let hidhide_ok = is_hidhide_installed();
 
-    if vigem_ok  { ok("ViGEmBus driver   — installed"); } else { fail("ViGEmBus driver   — NOT found"); }
-    if hidhide_ok { ok("HidHide driver    — installed"); } else { fail("HidHide driver    — NOT found"); }
+    if vigem_ok   { log_ok("ViGEmBus driver    installed"); }
+    else          { log_fail("ViGEmBus driver    NOT found"); }
+    if hidhide_ok { log_ok("HidHide driver     installed"); }
+    else          { log_fail("HidHide driver     NOT found"); }
 
-    sep();
+    section_end();
 
     if vigem_ok && hidhide_ok { return; }
 
-    println!();
     if !vigem_ok {
-        warn("ViGEmBus is missing — download and install it (no reboot needed).");
-        info(&format!("URL: {}", VIGEMBUS_URL));
+        log_warn("ViGEmBus is missing — install it (no reboot needed).");
         open_browser(VIGEMBUS_URL);
-        println!("{}│{}", DIM, RESET);
     }
     if !hidhide_ok {
-        warn("HidHide is missing — download and install it (reboot required after).");
-        info(&format!("URL: {}", HIDHIDE_URL));
+        log_warn("HidHide is missing — install it (reboot required after).");
         open_browser(HIDHIDE_URL);
-        println!("{}│{}", DIM, RESET);
     }
 
-    if !vigem_ok && !hidhide_ok {
-        warn("Install both drivers, reboot, then re-run this program.");
-    } else if !hidhide_ok {
-        warn("Install HidHide, reboot, then re-run this program.");
-    } else {
-        warn("Install ViGEmBus, then re-run this program (no reboot needed).");
-    }
-
-    sep();
-    println!();
     pause_and_exit(1);
 }
 
-struct AntiCheatInfo {
-    name: &'static str,
-    process: &'static str,
-    message: &'static str,
-}
+struct AntiCheatInfo { name: &'static str, process: &'static str, message: &'static str }
 
 const ANTICHEAT_PROCESSES: &[AntiCheatInfo] = &[
-    AntiCheatInfo {
-        name: "Vanguard",
-        process: "vanguard.exe",
-        message: "DO NOT use this tool while having Vanguard open, you risk a permanent ban on Valorant",
-    },
-    AntiCheatInfo {
-        name: "Vanguard",
-        process: "vgc.exe",
-        message: "DO NOT use this tool while having Vanguard open, you risk a permanent ban on Valorant",
-    },
-    AntiCheatInfo {
-        name: "Vanguard",
-        process: "vgk.sys",
-        message: "DO NOT use this tool while having Vanguard open, you risk a permanent ban on Valorant",
-    },
-    AntiCheatInfo {
-        name: "EasyAntiCheat",
-        process: "EasyAntiCheat.exe",
-        message: "EasyAntiCheat is running — close the game, restart this tool, then reopen the game",
-    },
-    AntiCheatInfo {
-        name: "EasyAntiCheat",
-        process: "EasyAntiCheat_EOS.exe",
-        message: "EasyAntiCheat (EOS) is running — close the game, restart this tool, then reopen the game",
-    },
-    AntiCheatInfo {
-        name: "EasyAntiCheat",
-        process: "EasyAntiCheat_EOS.sys",
-        message: "EasyAntiCheat is running — close the game, restart this tool, then reopen the game",
-    },
-    AntiCheatInfo {
-        name: "BattlEye",
-        process: "BEService.exe",
-        message: "BattlEye is running — close the game",
-    },
-    AntiCheatInfo {
-        name: "BattlEye",
-        process: "BEDaisy.sys",
-        message: "BattlEye is running — close the game",
-    },
-    AntiCheatInfo {
-        name: "nProtect GameGuard",
-        process: "GameMon.des",
-        message: "GameGuard is running — close the game",
-    },
-    AntiCheatInfo {
-        name: "nProtect GameGuard",
-        process: "GGAuth.exe",
-        message: "GameGuard is running — close the game",
-    },
-    AntiCheatInfo {
-        name: "FACEIT",
-        process: "faceit.exe",
-        message: "FACEIT AC is running — close FACEIT",
-    },
-    AntiCheatInfo {
-        name: "Ricochet",
-        process: "ricochet.sys",
-        message: "Ricochet is running — close the game",
-    },
+    AntiCheatInfo { name: "Vanguard",           process: "vanguard.exe",          message: "DO NOT use this tool with Vanguard — permanent Valorant ban risk." },
+    AntiCheatInfo { name: "Vanguard",           process: "vgc.exe",               message: "DO NOT use this tool with Vanguard — permanent Valorant ban risk." },
+    AntiCheatInfo { name: "Vanguard",           process: "vgk.sys",               message: "DO NOT use this tool with Vanguard — permanent Valorant ban risk." },
+    AntiCheatInfo { name: "EasyAntiCheat",      process: "EasyAntiCheat.exe",     message: "Close the game, restart this tool, then reopen the game." },
+    AntiCheatInfo { name: "EasyAntiCheat",      process: "EasyAntiCheat_EOS.exe", message: "Close the game, restart this tool, then reopen the game." },
+    AntiCheatInfo { name: "EasyAntiCheat",      process: "EasyAntiCheat_EOS.sys", message: "Close the game, restart this tool, then reopen the game." },
+    AntiCheatInfo { name: "BattlEye",           process: "BEService.exe",         message: "Close the game before running this tool." },
+    AntiCheatInfo { name: "BattlEye",           process: "BEDaisy.sys",           message: "Close the game before running this tool." },
+    AntiCheatInfo { name: "nProtect GameGuard", process: "GameMon.des",           message: "Close the game before running this tool." },
+    AntiCheatInfo { name: "nProtect GameGuard", process: "GGAuth.exe",            message: "Close the game before running this tool." },
+    AntiCheatInfo { name: "FACEIT",             process: "faceit.exe",            message: "Close FACEIT before running this tool." },
+    AntiCheatInfo { name: "Ricochet",           process: "ricochet.sys",          message: "Close the game before running this tool." },
 ];
 
 fn check_anti_cheat() {
@@ -257,13 +142,10 @@ fn check_anti_cheat() {
 
     for ac in ANTICHEAT_PROCESSES {
         if output.contains(&ac.process.to_lowercase()) {
-            section("ANTI-CHEAT DETECTED");
-            fail(&format!("{} ({}) is running!", ac.name, ac.process));
-            println!();
-            warn(ac.message);
-            warn("Do NOT run this tool while an anti-cheat is active.");
-            sep();
-            println!();
+            section_header("ANTI-CHEAT DETECTED");
+            log_fail(&format!("{} is running  ({})", ac.name, ac.process));
+            log_warn(ac.message);
+            section_end();
             pause_and_exit(1);
         }
     }
@@ -295,20 +177,16 @@ fn hidhide_cli() -> Option<PathBuf> {
 }
 
 fn hidhide_run(cli: &Path, args: &[&str]) -> String {
-    let out = Command::new(cli).args(args).output().ok();
-    match out {
-        Some(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        None => String::new(),
-    }
+    Command::new(cli).args(args).output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
 }
 
 fn gaming_device_paths(cli: &Path) -> Vec<String> {
     let json_str = hidhide_run(cli, &["--dev-gaming"]);
     if json_str.trim().is_empty() { return vec![]; }
-
     let parsed: serde_json::Value =
         serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
-
     let mut paths = Vec::new();
     if let Some(groups) = parsed.as_array() {
         for group in groups {
@@ -329,38 +207,34 @@ fn gaming_device_paths(cli: &Path) -> Vec<String> {
 }
 
 fn setup_hidhide(own_exe: &Path) {
-    section("HIDHIDE CLOAKING");
+    section_header("HIDHIDE CLOAKING");
 
     let cli = match hidhide_cli() {
-        Some(p) => { info(&format!("CLI found at: {}", p.display())); p }
+        Some(p) => p,
         None => {
-            warn("HidHide CLI not found — physical controller will NOT be hidden.");
-            warn("Re-run after rebooting if HidHide was just installed.");
-            sep();
+            log_warn("HidHide CLI not found — controller will NOT be hidden.");
+            section_end();
             return;
         }
     };
 
-    info("Scanning for gaming devices...");
     let devices = gaming_device_paths(&cli);
     if devices.is_empty() {
-        warn("No gaming devices found. Is the controller connected?");
-        sep();
+        log_warn("No gaming devices found. Is the controller connected?");
+        section_end();
         return;
     }
 
     for dev in &devices {
-        info(&format!("Hiding: {}", dev));
         hidhide_run(&cli, &["--dev-hide", dev]);
     }
+    log_ok(&format!("{} device(s) hidden", devices.len()));
 
     let exe_str = own_exe.to_str().unwrap_or("");
-    info(&format!("Whitelisting: {}", exe_str));
     hidhide_run(&cli, &["--app-reg", exe_str]);
-
     hidhide_run(&cli, &["--cloak-on"]);
-    ok("Cloaking active — physical controller hidden from games.");
-    sep();
+    log_ok("Cloaking active — physical controller hidden from games");
+    section_end();
 }
 
 fn cleanup_hidhide(own_exe: &Path) {
@@ -368,20 +242,21 @@ fn cleanup_hidhide(own_exe: &Path) {
         let exe_str = own_exe.to_str().unwrap_or("");
         hidhide_run(&cli, &["--cloak-off"]);
         hidhide_run(&cli, &["--app-unreg", exe_str]);
-        hidhide_run(&cli, &["--dev-unhide", "*"]);
+        let devices = gaming_device_paths(&cli);
+        for dev in &devices {
+            hidhide_run(&cli, &["--dev-unhide", dev]);
+        }
     }
 }
 
-static RUNNING_FLAG: AtomicBool = AtomicBool::new(true);
-static OWN_EXE_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
 unsafe extern "system" fn ctrl_handler(event: u32) -> i32 {
-    if event == CTRL_C_EVENT {
-        RUNNING_FLAG.store(false, Ordering::Relaxed);
-        if let Some(path) = OWN_EXE_PATH.get() {
-            cleanup_hidhide(path);
+    match event {
+        0 | 2 | 5 | 6 => {
+            SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_secs(3));
+            std::process::exit(0);
         }
-        std::process::exit(0);
+        _ => {}
     }
     0
 }
@@ -390,64 +265,70 @@ fn xinput_vidpid(index: u32) -> Option<String> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let key_path = format!(r"SYSTEM\CurrentControlSet\Services\XboxGip\Parameters\Devices\{:04}", index);
     if let Ok(k) = hklm.open_subkey(&key_path) {
-        if let Ok(v) = k.get_value::<String, _>("DeviceName") {
-            return Some(v.to_uppercase());
-        }
+        if let Ok(v) = k.get_value::<String, _>("DeviceName") { return Some(v.to_uppercase()); }
     }
     if let Ok(k) = hklm.open_subkey(r"SYSTEM\CurrentControlSet\Services\xinputhid\Enum") {
-        if let Ok(v) = k.get_value::<String, _>(&index.to_string()) {
-            return Some(v.to_uppercase());
-        }
+        if let Ok(v) = k.get_value::<String, _>(&index.to_string()) { return Some(v.to_uppercase()); }
     }
     None
 }
 
 fn is_vigem_virtual(index: u32) -> bool {
-    xinput_vidpid(index)
-        .map(|s| s.contains("PID_028E"))
-        .unwrap_or(false)
+    xinput_vidpid(index).map(|s| s.contains("PID_028E")).unwrap_or(false)
 }
 
 fn find_physical_controller(xinput: &XInputHandle) -> Option<u32> {
     for i in 0..4u32 {
-        if xinput.get_state(i).is_ok() && !is_vigem_virtual(i) {
-            return Some(i);
-        }
+        if xinput.get_state(i).is_ok() && !is_vigem_virtual(i) { return Some(i); }
     }
     (0..4).find(|&i| xinput.get_state(i).is_ok())
 }
 
 fn ps_axis_to_i16(v: u8) -> i16 {
-    let centered = v as i32 - 0x80;
-    let scaled = if centered >= 0 {
-        (centered * 32767 / 127).min(32767)
-    } else {
-        (centered * 32767 / 128).max(-32767)
-    };
-    scaled as i16
+    let c = v as i32 - 0x80;
+    (if c >= 0 { c * 32767 / 127 } else { c * 32767 / 128 }).clamp(-32767, 32767) as i16
 }
 
 fn ask_controller_type() -> ControllerType {
-    section("CONTROLLER TYPE");
-    println!("{}│{}  Select your controller type:", DIM, RESET);
-    println!("{}│{}", DIM, RESET);
-    println!("{}│{}  {}[1]{} Xbox / Xbox-compatible", DIM, RESET, CYAN, RESET);
-    println!("{}│{}  {}[2]{} DualSense (PS5)", DIM, RESET, CYAN, RESET);
-    println!("{}│{}  {}[3]{} DualShock 4 (PS4)", DIM, RESET, CYAN, RESET);
-    println!("{}│{}", DIM, RESET);
-    print!("{}│{}  Enter choice (1/2/3): ", DIM, RESET);
-    std::io::stdout().flush().unwrap();
+    use crossterm::{cursor, execute, style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor}};
+    use std::io::Write;
+
+    section_header("CONTROLLER");
+    execute!(stdout(),
+        SetForegroundColor(Color::DarkGrey), Print("  │\r\n"),
+        SetForegroundColor(Color::DarkGrey), Print("  │  "),
+        ResetColor, Print("Select your controller type:\r\n"),
+        SetForegroundColor(Color::DarkGrey), Print("  │\r\n"),
+        SetForegroundColor(Color::DarkGrey), Print("  │  "),
+        SetForegroundColor(Color::Cyan), SetAttribute(Attribute::Bold), Print("1"),
+        ResetColor, Print("  Xbox / Xbox-compatible\r\n"),
+        SetForegroundColor(Color::DarkGrey), Print("  │  "),
+        SetForegroundColor(Color::Cyan), SetAttribute(Attribute::Bold), Print("2"),
+        ResetColor, Print("  DualSense (PS5)\r\n"),
+        SetForegroundColor(Color::DarkGrey), Print("  │  "),
+        SetForegroundColor(Color::Cyan), SetAttribute(Attribute::Bold), Print("3"),
+        ResetColor, Print("  DualShock 4 (PS4)\r\n"),
+        SetForegroundColor(Color::DarkGrey), Print("  │\r\n"),
+        SetForegroundColor(Color::DarkGrey), Print("  │  "), ResetColor,
+    ).ok();
+
+    execute!(stdout(), cursor::Hide).ok();
+    print!("Choice › ");
+    stdout().flush().unwrap();
 
     loop {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
         match input.trim() {
-            "1" => { ok("Xbox controller selected."); sep(); return ControllerType::Xbox; }
-            "2" => { ok("DualSense (PS5) selected."); sep(); return ControllerType::DualSense; }
-            "3" => { ok("DualShock 4 (PS4) selected."); sep(); return ControllerType::DualShock4; }
+            "1" => { execute!(stdout(), cursor::Show).ok(); log_ok("Xbox selected"); section_end(); return ControllerType::Xbox; }
+            "2" => { execute!(stdout(), cursor::Show).ok(); log_ok("DualSense (PS5) selected"); section_end(); return ControllerType::DualSense; }
+            "3" => { execute!(stdout(), cursor::Show).ok(); log_ok("DualShock 4 (PS4) selected"); section_end(); return ControllerType::DualShock4; }
             _ => {
-                print!("{}│{}  Invalid — enter 1, 2 or 3: ", DIM, RESET);
-                std::io::stdout().flush().unwrap();
+                execute!(stdout(),
+                    SetForegroundColor(Color::DarkGrey), Print("  │  "), ResetColor,
+                ).ok();
+                print!("Choice › ");
+                stdout().flush().unwrap();
             }
         }
     }
@@ -455,163 +336,138 @@ fn ask_controller_type() -> ControllerType {
 
 fn read_ds4(buf: &[u8]) -> (i16, i16, i16, i16, u8, u8, u16, bool) {
     let offset = if buf[0] == 0x01 { 1 } else { 3 };
-    let lx  =  ps_axis_to_i16(buf[offset]);
-    let ly  = -ps_axis_to_i16(buf[offset + 1]);
-    let rx  =  ps_axis_to_i16(buf[offset + 2]);
-    let ry  = -ps_axis_to_i16(buf[offset + 3]);
-    let lt  = buf[offset + 7];
-    let rt  = buf[offset + 8];
-
+    if buf.len() < offset + 9 { return (0, 0, 0, 0, 0, 0, 0, false); }
+    let lx =  ps_axis_to_i16(buf[offset]);
+    let ly = -ps_axis_to_i16(buf[offset + 1]);
+    let rx =  ps_axis_to_i16(buf[offset + 2]);
+    let ry = -ps_axis_to_i16(buf[offset + 3]);
+    let lt = buf[offset + 7];
+    let rt = buf[offset + 8];
     let face     = buf[offset + 4];
     let shoulder = buf[offset + 5];
-
-    let dpad = face & 0x0F;
-    let dpad_up    = matches!(dpad, 0|1|7);
-    let dpad_down  = matches!(dpad, 3|4|5);
-    let dpad_left  = matches!(dpad, 5|6|7);
-    let dpad_right = matches!(dpad, 1|2|3);
-
-    let square   = (face & 0x10) != 0;
-    let cross    = (face & 0x20) != 0;
-    let circle   = (face & 0x40) != 0;
-    let triangle = (face & 0x80) != 0;
-
-    let l1      = (shoulder & 0x01) != 0; // bit0
-    let r1      = (shoulder & 0x02) != 0; // bit1
-    let share   = (shoulder & 0x10) != 0; // bit4
-    let options = (shoulder & 0x20) != 0; // bit5
-    let l3      = (shoulder & 0x40) != 0; // bit6
-    let r3      = (shoulder & 0x80) != 0; // bit7
-
+    let dpad = face & 0x0F;    // low nibble = dpad (0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW, 8=none)
     let mut btns: u16 = 0;
-    if dpad_up    { btns |= 0x0001; }
-    if dpad_down  { btns |= 0x0002; }
-    if dpad_left  { btns |= 0x0004; }
-    if dpad_right { btns |= 0x0008; }
-
-    if cross      { btns |= 0x1000; } // A
-    if circle     { btns |= 0x2000; } // B
-    if square     { btns |= 0x4000; } // X
-    if triangle   { btns |= 0x8000; } // Y
-    if l1         { btns |= 0x0100; } // LB
-    if r1         { btns |= 0x0200; } // RB
-    if l3         { btns |= 0x0040; } // LS
-    if r3         { btns |= 0x0080; } // RS
-    if options    { btns |= 0x0010; } // Start
-    if share      { btns |= 0x0020; } // Back
-
-    let lt_held = lt > 30;
-    (lx, ly, rx, ry, lt, rt, btns, lt_held)
+    if matches!(dpad, 0|1|7) { btns |= 0x0001; } // dpad up
+    if matches!(dpad, 3|4|5) { btns |= 0x0002; } // dpad down
+    if matches!(dpad, 5|6|7) { btns |= 0x0004; } // dpad left
+    if matches!(dpad, 1|2|3) { btns |= 0x0008; } // dpad right
+    if face & 0x20 != 0      { btns |= 0x1000; } // cross    → A
+    if face & 0x40 != 0      { btns |= 0x2000; } // circle   → B
+    if face & 0x10 != 0      { btns |= 0x4000; } // square   → X
+    if face & 0x80 != 0      { btns |= 0x8000; } // triangle → Y
+    if shoulder & 0x01 != 0  { btns |= 0x0100; } // L1 → LB
+    if shoulder & 0x02 != 0  { btns |= 0x0200; } // R1 → RB
+    if shoulder & 0x40 != 0  { btns |= 0x0040; } // L3 → LS
+    if shoulder & 0x80 != 0  { btns |= 0x0080; } // R3 → RS
+    if shoulder & 0x20 != 0  { btns |= 0x0010; } // options → Start
+    if shoulder & 0x10 != 0  { btns |= 0x0020; } // share   → Back
+    (lx, ly, rx, ry, lt, rt, btns, lt > 30)
 }
 
 fn read_dualsense(buf: &[u8]) -> (i16, i16, i16, i16, u8, u8, u16, bool) {
     let offset = if buf[0] == 0x31 { 3 } else { 1 };
-    let lx  =  ps_axis_to_i16(buf[offset]);
-    let ly  = -ps_axis_to_i16(buf[offset + 1]);
-    let rx  =  ps_axis_to_i16(buf[offset + 2]);
-    let ry  = -ps_axis_to_i16(buf[offset + 3]);
-    let lt  = buf[offset + 4];
-    let rt  = buf[offset + 5];
-
-    let btns1 = buf[offset + 7]; // dpad + face
-    let btns2 = buf[offset + 8]; // l1/r1/l2/r2/create/options/l3/r3
-
-    let dpad = btns1 & 0x0F;
-    let dpad_up    = matches!(dpad, 0|1|7);
-    let dpad_down  = matches!(dpad, 3|4|5);
-    let dpad_left  = matches!(dpad, 5|6|7);
-    let dpad_right = matches!(dpad, 1|2|3);
-
-    let square   = (btns1 & 0x10) != 0;
-    let cross    = (btns1 & 0x20) != 0;
-    let circle   = (btns1 & 0x40) != 0;
-    let triangle = (btns1 & 0x80) != 0;
-
-    let l1      = (btns2 & 0x01) != 0;
-    let r1      = (btns2 & 0x02) != 0;
-    let create  = (btns2 & 0x10) != 0; // Create → Back
-    let options = (btns2 & 0x20) != 0; // Options → Start
-    let l3      = (btns2 & 0x40) != 0;
-    let r3      = (btns2 & 0x80) != 0;
-
+    if buf.len() < offset + 9 { return (0, 0, 0, 0, 0, 0, 0, false); }
+    let lx =  ps_axis_to_i16(buf[offset]);
+    let ly = -ps_axis_to_i16(buf[offset + 1]);
+    let rx =  ps_axis_to_i16(buf[offset + 2]);
+    let ry = -ps_axis_to_i16(buf[offset + 3]);
+    let lt = buf[offset + 4];
+    let rt = buf[offset + 5];
+    let b1 = buf[offset + 7]; // dpad + face
+    let b2 = buf[offset + 8]; // l1/r1/l2/r2/create/options/l3/r3
+    let dpad = b1 & 0x0F;    // low nibble = dpad (0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW, 8=none)
     let mut btns: u16 = 0;
-    if dpad_up    { btns |= 0x0001; }
-    if dpad_down  { btns |= 0x0002; }
-    if dpad_left  { btns |= 0x0004; }
-    if dpad_right { btns |= 0x0008; }
-    if cross      { btns |= 0x1000; } // A
-    if circle     { btns |= 0x2000; } // B
-    if square     { btns |= 0x4000; } // X
-    if triangle   { btns |= 0x8000; } // Y
-    if l1         { btns |= 0x0100; } // LB
-    if r1         { btns |= 0x0200; } // RB
-    if l3         { btns |= 0x0040; } // LS
-    if r3         { btns |= 0x0080; } // RS
-    if options    { btns |= 0x0010; } // Start
-    if create     { btns |= 0x0020; } // Back
-
-    let lt_held = lt > 30;
-    (lx, ly, rx, ry, lt, rt, btns, lt_held)
+    if matches!(dpad, 0|1|7) { btns |= 0x0001; } // dpad up
+    if matches!(dpad, 3|4|5) { btns |= 0x0002; } // dpad down
+    if matches!(dpad, 5|6|7) { btns |= 0x0004; } // dpad left
+    if matches!(dpad, 1|2|3) { btns |= 0x0008; } // dpad right
+    if b1 & 0x20 != 0 { btns |= 0x1000; } // cross    → A
+    if b1 & 0x40 != 0 { btns |= 0x2000; } // circle   → B
+    if b1 & 0x10 != 0 { btns |= 0x4000; } // square   → X
+    if b1 & 0x80 != 0 { btns |= 0x8000; } // triangle → Y
+    if b2 & 0x01 != 0 { btns |= 0x0100; } // L1 → LB
+    if b2 & 0x02 != 0 { btns |= 0x0200; } // R1 → RB
+    if b2 & 0x40 != 0 { btns |= 0x0040; } // L3
+    if b2 & 0x80 != 0 { btns |= 0x0080; } // R3
+    if b2 & 0x20 != 0 { btns |= 0x0010; } // options → Start
+    if b2 & 0x10 != 0 { btns |= 0x0020; } // create  → Back
+    (lx, ly, rx, ry, lt, rt, btns, lt > 30)
 }
 
 fn play_connect() {
     unsafe {
-        let alias: Vec<u16> = "DeviceConnect\0".encode_utf16().collect();
-        PlaySoundW(alias.as_ptr(), std::ptr::null_mut(), SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
+        let a: Vec<u16> = "DeviceConnect\0".encode_utf16().collect();
+        PlaySoundW(a.as_ptr(), std::ptr::null_mut(), SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
     }
 }
 
 fn play_disconnect() {
     unsafe {
-        let alias: Vec<u16> = "DeviceDisconnect\0".encode_utf16().collect();
-        PlaySoundW(alias.as_ptr(), std::ptr::null_mut(), SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
+        let a: Vec<u16> = "DeviceDisconnect\0".encode_utf16().collect();
+        PlaySoundW(a.as_ptr(), std::ptr::null_mut(), SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
     }
+}
+
+fn handle_f5_toggle(enabled: &AtomicBool, f5_was_down: &mut bool) {
+    let f5_down = unsafe { GetAsyncKeyState(VK_F5) } as u16 & 0x8000 != 0;
+    if f5_down && !*f5_was_down {
+        let new_state = !enabled.load(Ordering::Relaxed);
+        enabled.store(new_state, Ordering::Relaxed);
+        if new_state { play_connect(); } else { play_disconnect(); }
+        update_aim_status(new_state);
+    }
+    *f5_was_down = f5_down;
 }
 
 fn precise_spin_wait(deadline: Instant) {
-    while Instant::now() < deadline {
-        std::hint::spin_loop();
-    }
+    while Instant::now() < deadline { std::hint::spin_loop(); }
 }
 
 fn xinput_read_loop(
-    phys_idx: u32,
+    initial_idx: u32,
     tx: Sender<XGamepad>,
-    enabled: std::sync::Arc<AtomicBool>,
-    running: std::sync::Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
 ) {
     elevate_thread_priority();
     let xinput = XInputHandle::load_default().expect("Failed to load XInput");
     let mut tick: u64 = 0;
+    let mut phys_idx = initial_idx;
+    let mut errors: u32 = 0;
 
     while running.load(Ordering::Relaxed) {
         let deadline = Instant::now() + Duration::from_micros(POLL_US);
-
         let phys = match xinput.get_state(phys_idx) {
-            Ok(s) => s,
+            Ok(s) => { errors = 0; s }
             Err(_) => {
-                thread::sleep(Duration::from_millis(500));
+                errors += 1;
+                if errors >= 10 {
+                    let _ = tx.send(XGamepad::default());
+                    if let Some(idx) = find_physical_controller(&xinput) {
+                        phys_idx = idx; errors = 0;
+                    } else {
+                        thread::sleep(Duration::from_millis(500));
+                    }
+                }
                 continue;
             }
         };
 
-        let gp = &phys.raw.Gamepad;
-        let lt_held = gp.bLeftTrigger > 30;
+        let gp         = &phys.raw.Gamepad;
+        let lt_held    = gp.bLeftTrigger > 30;
         let stick_idle = (gp.sThumbLX as i32).abs() < 8000 && (gp.sThumbLY as i32).abs() < 8000;
-        let jitter_active = (enabled.load(Ordering::Relaxed) || lt_held) && stick_idle;
-        let axis_value: i16 = if tick % 2 == 0 { AXIS_MIN } else { AXIS_MAX };
+        let jitter     = (enabled.load(Ordering::Relaxed) || lt_held) && stick_idle;
+        let axis: i16  = if tick % 2 == 0 { AXIS_MIN } else { AXIS_MAX };
 
-        let gamepad = XGamepad {
+        let _ = tx.send(XGamepad {
             buttons:       vigem_client::XButtons(gp.wButtons),
             left_trigger:  gp.bLeftTrigger,
             right_trigger: gp.bRightTrigger,
-            thumb_lx:      if jitter_active { axis_value } else { gp.sThumbLX },
+            thumb_lx:      if jitter { axis } else { gp.sThumbLX },
             thumb_ly:      gp.sThumbLY,
             thumb_rx:      gp.sThumbRX,
             thumb_ry:      gp.sThumbRY,
-        };
-
-        let _ = tx.send(gamepad);
+        });
         tick = tick.wrapping_add(1);
         precise_spin_wait(deadline);
     }
@@ -634,97 +490,99 @@ fn hid_read_loop(
     };
 
     let mut dev = None;
-    let mut elapsed = 0u64;
-    let mut hint_shown = false;
 
     loop {
-        let hid = match hidapi::HidApi::new() {
-            Ok(h) => h,
-            Err(_) => {
-                thread::sleep(Duration::from_secs(1));
-                elapsed += 1;
-                continue;
-            }
-        };
-        for device in hid.device_list() {
-            if device.vendor_id() == vid && pids.contains(&device.product_id()) {
-                if let Ok(opened) = device.open_device(&hid) {
-                    dev = Some(opened);
-                    break;
+        if let Ok(hid) = hidapi::HidApi::new() {
+            for device in hid.device_list() {
+                if device.vendor_id() == vid && pids.contains(&device.product_id()) {
+                    if let Ok(opened) = device.open_device(&hid) {
+                        dev = Some(opened);
+                        break;
+                    }
                 }
             }
         }
-
-        if dev.is_some() {
-            break;
-        }
-
-        if elapsed >= 10 && !hint_shown {
-            println!();
-            warn("Controller not detected after 10 seconds.");
-            warn("Make sure the controller is connected via USB or Bluetooth.");
-            warn("If Bluetooth: unpair in Windows Settings, then re-pair.");
-            hint_shown = true;
-        }
-        print!(".");
-        std::io::stdout().flush().ok();
+        if dev.is_some() { break; }
+        if !running.load(Ordering::Relaxed) { return; }
         thread::sleep(Duration::from_secs(1));
-        elapsed += 1;
-
-        if !running.load(Ordering::Relaxed) {
-            return;
-        }
     }
-
     let _ = ready_tx.try_send(());
 
-    let device = dev.unwrap();
-    device.set_blocking_mode(true).ok();
-
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; 128];
     let mut tick: u64 = 0;
 
-    while running.load(Ordering::Relaxed) {
-        let n = match device.read(&mut buf) {
-            Ok(n) => n,
-            Err(_) => break,
+    'reconnect: loop {
+        if !running.load(Ordering::Relaxed) { break; }
+
+        let device = match dev.take() {
+            Some(d) => d,
+            None => {
+                loop {
+                    if !running.load(Ordering::Relaxed) { return; }
+                    thread::sleep(Duration::from_secs(1));
+                    if let Ok(hid) = hidapi::HidApi::new() {
+                        for device in hid.device_list() {
+                            if device.vendor_id() == vid && pids.contains(&device.product_id()) {
+                                if let Ok(opened) = device.open_device(&hid) {
+                                    dev = Some(opened);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if dev.is_some() { break; }
+                }
+                continue 'reconnect;
+            }
         };
 
-        if n < 10 { continue; }
+        device.set_blocking_mode(true).ok();
 
-        let (lx, ly, rx, ry, lt, rt, buttons, lt_held) = match controller_type {
-            ControllerType::DualShock4 => read_ds4(&buf),
-            ControllerType::DualSense  => read_dualsense(&buf),
-            ControllerType::Xbox       => continue,
-        };
+        loop {
+            if !running.load(Ordering::Relaxed) { break 'reconnect; }
+            let n = match device.read(&mut buf) {
+                Ok(n) => n,
+                Err(_) => {
+                    if let Ok(mut t) = target.lock() { let _ = t.update(&XGamepad::default()); }
+                    break;
+                }
+            };
+            if n < 10 { continue; }
 
-        let stick_idle = (lx as i32).abs() < 8000 && (ly as i32).abs() < 8000;
-        let jitter_active = (enabled.load(Ordering::Relaxed) || lt_held) && stick_idle;
-        let axis_value: i16 = if tick % 2 == 0 { AXIS_MIN } else { AXIS_MAX };
+            let (lx, ly, rx, ry, lt, rt, buttons, lt_held) = match controller_type {
+                ControllerType::DualShock4 => read_ds4(&buf[..n]),
+                ControllerType::DualSense  => read_dualsense(&buf[..n]),
+                ControllerType::Xbox       => continue,
+            };
 
-        let gamepad = XGamepad {
-            buttons:       vigem_client::XButtons(buttons),
-            left_trigger:  lt,
-            right_trigger: rt,
-            thumb_lx:      if jitter_active { axis_value } else { lx },
-            thumb_ly:      ly,
-            thumb_rx:      rx,
-            thumb_ry:      ry,
-        };
+            let stick_idle = (lx as i32).abs() < 8000 && (ly as i32).abs() < 8000;
+            let jitter     = (enabled.load(Ordering::Relaxed) || lt_held) && stick_idle;
+            let axis: i16  = if tick % 2 == 0 { AXIS_MIN } else { AXIS_MAX };
 
-        if let Ok(mut t) = target.lock() {
-            let _ = t.update(&gamepad);
+            if let Ok(mut t) = target.lock() {
+                let _ = t.update(&XGamepad {
+                    buttons:       vigem_client::XButtons(buttons),
+                    left_trigger:  lt,
+                    right_trigger: rt,
+                    thumb_lx:      if jitter { axis } else { lx },
+                    thumb_ly:      ly,
+                    thumb_rx:      rx,
+                    thumb_ry:      ry,
+                });
+            }
+            tick = tick.wrapping_add(1);
         }
-        tick = tick.wrapping_add(1);
     }
 }
 
 fn main() {
+    let bypass = std::env::args().any(|a| a == "--bypass");
+
     enable_ansi();
     set_random_window_title();
     banner();
 
-    check_anti_cheat();
+    if !bypass { check_anti_cheat(); }
     check_dependencies();
 
     let controller_type = ask_controller_type();
@@ -732,23 +590,25 @@ fn main() {
     let own_exe = std::env::current_exe().expect("Failed to get exe path");
     setup_hidhide(&own_exe);
 
-    let game_running = Command::new("tasklist")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("fortniteclient"))
-        .unwrap_or(false);
+    if !bypass {
+        let game_running = Command::new("tasklist")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("fortniteclient"))
+            .unwrap_or(false);
 
-    if game_running {
-        section("WARNING");
-        warn("A game is already running!");
-        warn("The virtual controller may get a higher XInput index than");
-        warn("the physical one, causing double input.");
-        warn("Close the game, restart this tool first, then open the game.");
-        sep();
-        println!("\nPress Enter to continue anyway, or Ctrl+C to exit...");
-        let _ = std::io::stdin().read_line(&mut String::new());
+        if game_running {
+            section_header("WARNING");
+            log_warn("A game is already running!");
+            log_warn("Close the game, restart this tool, then reopen the game.");
+            log_warn("Otherwise the virtual controller may cause double input.");
+            section_end();
+            use crossterm::{execute, style::{Print, ResetColor}};
+            execute!(stdout(), Print("\r\n  Press Enter to continue anyway, or Ctrl+C to exit...\r\n"), ResetColor).ok();
+            let _ = std::io::stdin().read_line(&mut String::new());
+        }
     }
 
-    section("VIRTUAL CONTROLLER");
+    section_header("VIRTUAL CONTROLLER");
     let client = Client::connect().expect("Failed to connect to ViGEmBus.");
     let mut target = Xbox360Wired::new(client, vigem_client::TargetId::XBOX360_WIRED);
     target.plugin().expect("Failed to create virtual controller");
@@ -758,149 +618,97 @@ fn main() {
         if target.wait_ready().is_ok() { ready = true; break; }
     }
     if !ready {
-        fail("Virtual controller failed to initialize after several attempts.");
-        warn("Make sure ViGEmBus is properly installed and try running as Administrator.");
-        sep();
+        log_fail("Virtual controller failed to initialize.");
+        log_warn("Make sure ViGEmBus is installed and try running as Administrator.");
+        section_end();
         pause_and_exit(1);
     }
-    ok("Xbox 360 virtual controller is live.");
-    sep();
+    log_ok("Xbox 360 virtual controller ready");
+    section_end();
 
     let enabled = Arc::new(AtomicBool::new(false));
     let running = Arc::new(AtomicBool::new(true));
-    let target   = Arc::new(Mutex::new(target));
+    let target  = Arc::new(Mutex::new(target));
 
     OWN_EXE_PATH.set(own_exe.clone()).ok();
     unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 1); }
 
+    let cleanup_exe = own_exe.clone();
+    thread::spawn(move || {
+        while !SHUTDOWN_FLAG.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+        }
+        cleanup_hidhide(&cleanup_exe);
+        std::process::exit(0);
+    });
+
+    let controller_name = match controller_type {
+        ControllerType::Xbox       => "Xbox",
+        ControllerType::DualSense  => "DualSense (PS5)",
+        ControllerType::DualShock4 => "DualShock 4 (PS4)",
+    };
+
     match controller_type {
         ControllerType::Xbox => {
-            section("CONTROLLER DETECTION");
-            let xinput = XInputHandle::load_default().expect("Failed to load XInput.");
-            info("Waiting for Xbox controller (USB or Bluetooth)...");
+            section_header("CONTROLLER DETECTION");
+            log_info("Waiting for Xbox controller...");
 
-            let phys_idx = {
-                let mut elapsed = 0u64;
-                let mut hint_shown = false;
-                let mut dot_count = 0u32;
-                loop {
-                    match find_physical_controller(&xinput) {
-                        Some(i) => {
-                            let lines_to_clear = if hint_shown { 1 + 3 + dot_count / 60 } else { dot_count / 60 };
-                            for _ in 0..=lines_to_clear {
-                                print!("\x1b[1A\x1b[2K");
-                            }
-                            std::io::stdout().flush().unwrap();
-                            ok(&format!("Controller found at XInput index {}", i));
-                            break i;
+            let xinput = XInputHandle::load_default().expect("Failed to load XInput.");
+            let mut elapsed = 0u64;
+            let mut hint_shown = false;
+            let phys_idx = loop {
+                match find_physical_controller(&xinput) {
+                    Some(i) => { log_ok(&format!("Controller found at XInput slot {}", i)); break i; }
+                    None => {
+                        if elapsed >= 10 && !hint_shown {
+                            log_warn("Not detected after 10s. Try unplugging and replugging.");
+                            hint_shown = true;
                         }
-                        None => {
-                            if elapsed >= 10 && !hint_shown {
-                                println!();
-                                warn("Controller not detected after 10 seconds.");
-                                warn("If using Bluetooth: unpair the controller in Windows Settings,");
-                                warn("  then re-pair it. Do NOT just disconnect — full unpair required.");
-                                warn("If using USB: unplug and replug the cable.");
-                                hint_shown = true;
-                            }
-                            print!(".");
-                            dot_count += 1;
-                            if dot_count % 60 == 0 { println!(); }
-                            std::io::stdout().flush().unwrap();
-                            thread::sleep(Duration::from_millis(1000));
-                            elapsed += 1;
-                        }
+                        thread::sleep(Duration::from_secs(1));
+                        elapsed += 1;
                     }
                 }
             };
-            sep();
+            section_end();
 
             let (tx, rx) = channel::<XGamepad>();
-            let target_clone  = target.clone();
             let running_clone = running.clone();
             let enabled_clone = enabled.clone();
-            std::thread::spawn(move || {
-                xinput_read_loop(phys_idx, tx, enabled_clone, running_clone);
-            });
+            thread::spawn(move || xinput_read_loop(phys_idx, tx, enabled_clone, running_clone));
 
-            println!("\n{GREEN}{BOLD}╔{bar}╗{RESET}", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "READY  —  open your game NOW if not yet open", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "F5       →  toggle Aim Assist ON / OFF",       width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "L2       →  jitter while held (even if F5 OFF)", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "Ctrl+C   →  exit (BEFORE closing the game)",    width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-            println!("{GREEN}{BOLD}╚{bar}╝{RESET}\n", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            draw_dashboard(controller_name, false);
 
+            let target_clone  = target.clone();
             let mut f5_was_down = false;
             loop {
-                let f5_down = unsafe { GetAsyncKeyState(VK_F5) } as u16 & 0x8000 != 0;
-                if f5_down && !f5_was_down {
-                    let new_state = !enabled.load(Ordering::Relaxed);
-                    enabled.store(new_state, Ordering::Relaxed);
-                    if new_state {
-                        play_connect();
-                        println!("  {}{}[F5]{}  Aim Assist  ██ ON  ██{}", BOLD, GREEN, RESET, RESET);
-                    } else {
-                        play_disconnect();
-                        println!("  {}{}[F5]{}  Aim Assist  ░░ OFF ░░{}", BOLD, DIM, RESET, RESET);
-                    }
-                }
-                f5_was_down = f5_down;
-
-                let gamepad = match rx.recv_timeout(Duration::from_micros(POLL_US * 2)) {
-                    Ok(g) => g,
-                    Err(_) => continue,
-                };
-                if let Ok(mut t) = target_clone.lock() {
-                    if let Err(e) = t.update(&gamepad) {
-                        eprintln!("  [!] Virtual controller update error: {:?}", e);
-                    }
+                handle_f5_toggle(&enabled, &mut f5_was_down);
+                if let Ok(g) = rx.recv_timeout(Duration::from_micros(POLL_US * 2)) {
+                    if let Ok(mut t) = target_clone.lock() { let _ = t.update(&g); }
                 }
             }
         }
 
         ControllerType::DualShock4 | ControllerType::DualSense => {
-            section("CONTROLLER DETECTION");
-            let name = match controller_type {
-                ControllerType::DualSense  => "DualSense",
-                ControllerType::DualShock4 => "DualShock 4",
-                ControllerType::Xbox       => unreachable!(),
-            };
-            info(&format!("Waiting for {} (USB or Bluetooth)...", name));
+            section_header("CONTROLLER DETECTION");
+            log_info(&format!("Waiting for {} ...", controller_name));
 
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
             let target_clone  = target.clone();
             let running_clone = running.clone();
             let enabled_clone = enabled.clone();
-            std::thread::spawn(move || {
+            thread::spawn(move || {
                 hid_read_loop(controller_type, target_clone, ready_tx, enabled_clone, running_clone);
             });
 
             let _ = ready_rx.recv();
-            ok(&format!("{} connected.", name));
-            sep();
+            log_ok(&format!("{} connected", controller_name));
+            section_end();
 
-            println!("\n{GREEN}{BOLD}╔{bar}╗{RESET}", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "READY  —  open your game NOW if not yet open", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "F5       →  toggle Aim Assist ON / OFF",       width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "L2       →  jitter while held (even if F5 OFF)", width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-            println!("{GREEN}{BOLD}║  {:<width$}║{RESET}", "Ctrl+C   →  exit (BEFORE closing the game)",    width=W-4, GREEN=GREEN, BOLD=BOLD, RESET=RESET);
-            println!("{GREEN}{BOLD}╚{bar}╝{RESET}\n", bar="═".repeat(W-2), GREEN=GREEN, BOLD=BOLD, RESET=RESET);
+            draw_dashboard(controller_name, false);
 
             let mut f5_was_down = false;
             loop {
-                let f5_down = unsafe { GetAsyncKeyState(VK_F5) } as u16 & 0x8000 != 0;
-                if f5_down && !f5_was_down {
-                    let new_state = !enabled.load(Ordering::Relaxed);
-                    enabled.store(new_state, Ordering::Relaxed);
-                    if new_state {
-                        play_connect();
-                        println!("  {}{}[F5]{}  Aim Assist  ██ ON  ██{}", BOLD, GREEN, RESET, RESET);
-                    } else {
-                        play_disconnect();
-                        println!("  {}{}[F5]{}  Aim Assist  ░░ OFF ░░{}", BOLD, DIM, RESET, RESET);
-                    }
-                }
-                f5_was_down = f5_down;
+                handle_f5_toggle(&enabled, &mut f5_was_down);
                 thread::sleep(Duration::from_millis(8));
             }
         }
