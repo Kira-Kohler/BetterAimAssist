@@ -38,19 +38,21 @@ graph LR
 - **hidapi** with native Windows HID driver for Sony controllers
 - Automatic driver detection — opens download page if something is missing
 - Hides physical controller via **HidHide** (no double input)
-- **EasyAntiCheat detection** — refuses to run if EAC is active
+- **Anti-cheat detection** — warns on EAC, BattlEye, Vanguard, FACEIT, Ricochet, GameGuard
+- `--bypass` flag to skip anti-cheat checks (only use when restarting the tool with the game already open — may cause double input)
 - Mirrors all buttons, triggers and sticks in real time
 - **F5** toggles jitter on/off — **L2** activates while held
 - Jitter pauses when you move the left stick
 - **4ms polling** (250Hz) with spin-wait timing
 - High-priority input thread for consistent timing
-- Graceful exit with **Ctrl+C**
+- Graceful exit with **Ctrl+C** — physical controller automatically unhidden
 
 ### <img height="18" src="./src/assets/readme/structure.svg" style="vertical-align: middle;">&nbsp;&nbsp;Structure
 
 ```
 src/
-├── main.rs                # Entry point
+├── main.rs                # Entry point and controller logic
+├── ui.rs                  # Terminal UI (crossterm)
 ├── build.rs               # Windows resources
 ├── Cargo.toml             # Dependencies
 └── resources/
@@ -105,13 +107,14 @@ src/
 
 | Problem | Fix |
 |---------|-----|
-| **EAC detected on startup** | Close the game first |
+| **Anti-cheat detected on startup** | Close the game first. Use `--bypass` only if restarting the tool with the game already open — it skips anti-cheat checks but may cause double input |
 | **Controller not detected** | Wait 10s or reconnect Bluetooth |
 | **Double input** | Launch tool *before* the game |
 | **Access denied** | Run as Administrator |
 | **Bluetooth Xbox not detected** | Unpair and re-pair in Windows Settings |
 | **PS4/PS5 controller not opening** | Close Steam, DS4Windows or any other app using the controller |
 | **HidHide CLI not found** | Reboot your PC after installing HidHide |
+| **Controller stays hidden after exit** | Never close via Task Manager — always use Ctrl+C |
 
 ### <img height="18" src="./src/assets/readme/building-from-source.svg" style="vertical-align: middle;">&nbsp;&nbsp;Building from Source
 
