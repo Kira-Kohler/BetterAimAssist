@@ -23,13 +23,14 @@ use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 
 use ui::{
     banner, draw_dashboard, log_fail, log_info, log_ok, log_warn,
-    pause_and_exit, section_end, section_header, update_aim_status, enable_ansi,
+    pause_and_exit, section_end, section_header, update_aim_status, update_trigger_mode_status, enable_ansi,
 };
 
 const AXIS_MAX: i16 = 32767;
 const AXIS_MIN: i16 = -32768;
 const POLL_US:  u64 = 4000;
 const VK_F5:    i32 = 0x74;
+const VK_F6:    i32 = 0x75;
 
 const VIGEMBUS_URL: &str =
     "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe";
@@ -43,9 +44,10 @@ const DUALSENSE_PID: u16    = 0x0CE6;
 #[derive(Clone, Copy)]
 enum ControllerType { Xbox, DualShock4, DualSense }
 
-pub static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
-pub static STATUS_ROW:    AtomicU16  = AtomicU16::new(0);
-static OWN_EXE_PATH:      std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+pub static SHUTDOWN_FLAG:     AtomicBool = AtomicBool::new(false);
+pub static STATUS_ROW:        AtomicU16  = AtomicU16::new(0);
+pub static TRIGGER_MODE_ROW:  AtomicU16  = AtomicU16::new(0);
+static OWN_EXE_PATH:          std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 const WINDOW_TITLES: &[&str] = &[
     "C:\\Windows\\System32\\cmd.exe",
@@ -419,6 +421,17 @@ fn handle_f5_toggle(enabled: &AtomicBool, f5_was_down: &mut bool) {
     *f5_was_down = f5_down;
 }
 
+fn handle_f6_toggle(trigger_mode: &AtomicBool, f6_was_down: &mut bool) {
+    let f6_down = unsafe { GetAsyncKeyState(VK_F6) } as u16 & 0x8000 != 0;
+    if f6_down && !*f6_was_down {
+        let new_state = !trigger_mode.load(Ordering::Relaxed);
+        trigger_mode.store(new_state, Ordering::Relaxed);
+        if new_state { play_connect(); } else { play_disconnect(); }
+        update_trigger_mode_status(new_state);
+    }
+    *f6_was_down = f6_down;
+}
+
 fn precise_spin_wait(deadline: Instant) {
     while Instant::now() < deadline { std::hint::spin_loop(); }
 }
@@ -427,6 +440,7 @@ fn xinput_read_loop(
     initial_idx: u32,
     tx: Sender<XGamepad>,
     enabled: Arc<AtomicBool>,
+    trigger_mode: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
 ) {
     elevate_thread_priority();
@@ -454,7 +468,7 @@ fn xinput_read_loop(
         };
 
         let gp         = &phys.raw.Gamepad;
-        let lt_held    = gp.bLeftTrigger > 30;
+        let lt_held    = trigger_mode.load(Ordering::Relaxed) && gp.bLeftTrigger > 30;
         let stick_idle = (gp.sThumbLX as i32).abs() < 8000 && (gp.sThumbLY as i32).abs() < 8000;
         let jitter     = (enabled.load(Ordering::Relaxed) || lt_held) && stick_idle;
         let axis: i16  = if tick % 2 == 0 { AXIS_MIN } else { AXIS_MAX };
@@ -478,6 +492,7 @@ fn hid_read_loop(
     target: Arc<Mutex<Xbox360Wired<Client>>>,
     ready_tx: std::sync::mpsc::SyncSender<()>,
     enabled: Arc<AtomicBool>,
+    trigger_mode: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
 ) {
     elevate_thread_priority();
@@ -555,8 +570,9 @@ fn hid_read_loop(
                 ControllerType::Xbox       => continue,
             };
 
+            let lt_active  = trigger_mode.load(Ordering::Relaxed) && lt_held;
             let stick_idle = (lx as i32).abs() < 8000 && (ly as i32).abs() < 8000;
-            let jitter     = (enabled.load(Ordering::Relaxed) || lt_held) && stick_idle;
+            let jitter     = (enabled.load(Ordering::Relaxed) || lt_active) && stick_idle;
             let axis: i16  = if tick % 2 == 0 { AXIS_MIN } else { AXIS_MAX };
 
             if let Ok(mut t) = target.lock() {
@@ -626,9 +642,10 @@ fn main() {
     log_ok("Xbox 360 virtual controller ready");
     section_end();
 
-    let enabled = Arc::new(AtomicBool::new(false));
-    let running = Arc::new(AtomicBool::new(true));
-    let target  = Arc::new(Mutex::new(target));
+    let enabled      = Arc::new(AtomicBool::new(false));
+    let trigger_mode = Arc::new(AtomicBool::new(true));
+    let running      = Arc::new(AtomicBool::new(true));
+    let target       = Arc::new(Mutex::new(target));
 
     OWN_EXE_PATH.set(own_exe.clone()).ok();
     unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 1); }
@@ -672,16 +689,19 @@ fn main() {
             section_end();
 
             let (tx, rx) = channel::<XGamepad>();
-            let running_clone = running.clone();
-            let enabled_clone = enabled.clone();
-            thread::spawn(move || xinput_read_loop(phys_idx, tx, enabled_clone, running_clone));
+            let running_clone      = running.clone();
+            let enabled_clone      = enabled.clone();
+            let trigger_mode_clone = trigger_mode.clone();
+            thread::spawn(move || xinput_read_loop(phys_idx, tx, enabled_clone, trigger_mode_clone, running_clone));
 
             draw_dashboard(controller_name, false);
 
             let target_clone  = target.clone();
             let mut f5_was_down = false;
+            let mut f6_was_down = false;
             loop {
                 handle_f5_toggle(&enabled, &mut f5_was_down);
+                handle_f6_toggle(&trigger_mode, &mut f6_was_down);
                 if let Ok(g) = rx.recv_timeout(Duration::from_micros(POLL_US * 2)) {
                     if let Ok(mut t) = target_clone.lock() { let _ = t.update(&g); }
                 }
@@ -693,11 +713,12 @@ fn main() {
             log_info(&format!("Waiting for {} ...", controller_name));
 
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-            let target_clone  = target.clone();
-            let running_clone = running.clone();
-            let enabled_clone = enabled.clone();
+            let target_clone       = target.clone();
+            let running_clone      = running.clone();
+            let enabled_clone      = enabled.clone();
+            let trigger_mode_clone = trigger_mode.clone();
             thread::spawn(move || {
-                hid_read_loop(controller_type, target_clone, ready_tx, enabled_clone, running_clone);
+                hid_read_loop(controller_type, target_clone, ready_tx, enabled_clone, trigger_mode_clone, running_clone);
             });
 
             let _ = ready_rx.recv();
@@ -707,8 +728,10 @@ fn main() {
             draw_dashboard(controller_name, false);
 
             let mut f5_was_down = false;
+            let mut f6_was_down = false;
             loop {
                 handle_f5_toggle(&enabled, &mut f5_was_down);
+                handle_f6_toggle(&trigger_mode, &mut f6_was_down);
                 thread::sleep(Duration::from_millis(8));
             }
         }

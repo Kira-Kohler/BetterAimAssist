@@ -8,7 +8,7 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 
-use crate::STATUS_ROW;
+use crate::{STATUS_ROW, TRIGGER_MODE_ROW};
 
 pub const W: u16 = 66;
 
@@ -244,6 +244,23 @@ pub fn draw_dashboard(controller_name: &str, enabled: bool) {
     }
 
     {
+        let (tmbadge, tmbadge_color) = ("[ ON ]", C_OK);
+        let label = "  Trigger Mode";
+        let g     = gap_spaces(vlen(label) + vlen(tmbadge));
+
+        let row = cursor::position().map(|p| p.1).unwrap_or(0);
+        TRIGGER_MODE_ROW.store(row, Ordering::Relaxed);
+
+        queue!(out,
+            SetForegroundColor(C_BORDER), SetAttribute(Attribute::Bold), Print("║ "), ResetColor,
+            SetAttribute(Attribute::Bold), SetForegroundColor(C_TITLE), Print(label), ResetColor,
+            Print(&g),
+            SetForegroundColor(tmbadge_color), SetAttribute(Attribute::Bold), Print(tmbadge), ResetColor,
+            SetForegroundColor(C_BORDER), SetAttribute(Attribute::Bold), Print(" ║\r\n"), ResetColor,
+        ).ok();
+    }
+
+    {
         let label = "  Controller";
         let g     = gap_spaces(vlen(label) + vlen(controller_name));
         queue!(out,
@@ -260,7 +277,7 @@ pub fn draw_dashboard(controller_name: &str, enabled: bool) {
     box_empty(C_BORDER);
 
     keybind(&mut out, "F5",     "Toggle aim assist on / off");
-    keybind(&mut out, "LT/L2", "Manual jitter while trigger is held");
+    keybind(&mut out, "F6",     "Toggle trigger (LT/L2) activation");
     keybind(&mut out, "Ctrl+C","Exit - restores controller automatically");
 
     box_empty(C_BORDER);
@@ -313,6 +330,28 @@ pub fn update_aim_status(enabled: bool) {
     let label = "  Aim Assist";
     let g     = gap_spaces(vlen(label) + vlen(badge));
     let row   = STATUS_ROW.load(Ordering::Relaxed);
+
+    execute!(stdout(),
+        cursor::SavePosition,
+        cursor::MoveTo(0, row),
+        SetForegroundColor(C_BORDER), SetAttribute(Attribute::Bold), Print("║ "), ResetColor,
+        SetAttribute(Attribute::Bold), SetForegroundColor(C_TITLE), Print(label), ResetColor,
+        Print(&g),
+        SetForegroundColor(color), SetAttribute(Attribute::Bold), Print(badge), ResetColor,
+        SetForegroundColor(C_BORDER), SetAttribute(Attribute::Bold), Print(" ║"), ResetColor,
+        cursor::RestorePosition,
+    ).ok();
+}
+
+pub fn update_trigger_mode_status(enabled: bool) {
+    let (badge, color) = if enabled {
+        ("[ ON ]  ", C_OK)
+    } else {
+        ("[ OFF ] ", C_WARN)
+    };
+    let label = "  Trigger Mode";
+    let g     = gap_spaces(vlen(label) + vlen(badge));
+    let row   = TRIGGER_MODE_ROW.load(Ordering::Relaxed);
 
     execute!(stdout(),
         cursor::SavePosition,
